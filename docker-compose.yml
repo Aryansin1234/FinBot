@@ -1,0 +1,35 @@
+services:
+  backend:
+    build: ./backend
+    container_name: finbot-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - AICORE_CLIENT_ID=${AICORE_CLIENT_ID}
+      - AICORE_CLIENT_SECRET=${AICORE_CLIENT_SECRET}
+      - AICORE_AUTH_URL=${AICORE_AUTH_URL}
+      - AICORE_API_URL=${AICORE_API_URL}
+      - AICORE_RESOURCE_GROUP=${AICORE_RESOURCE_GROUP}
+      - AICORE_DEPLOYMENT_CHAT=${AICORE_DEPLOYMENT_CHAT}
+      - AICORE_DEPLOYMENT_EMBEDDING=${AICORE_DEPLOYMENT_EMBEDDING}
+      - CHROMA_PERSIST_DIR=/data/chroma
+    volumes:
+      - chroma_data:/data/chroma
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build: ./frontend
+    container_name: finbot-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  chroma_data:

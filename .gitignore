@@ -1,0 +1,23 @@
+# Environment secrets
+backend/.env
+.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+chroma_db/
+
+# Node
+node_modules/
+dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# k8s secrets (never commit real credentials)
+k8s/
+scripts/

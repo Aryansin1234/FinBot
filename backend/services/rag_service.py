@@ -1,25 +1,29 @@
 import uuid
 import os
+import time
+import logging
 from typing import Optional
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain.chains import RetrievalQA
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.prompts import PromptTemplate
+import chromadb
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from google.api_core.exceptions import ResourceExhausted
 
-from services.aicore_client import (
-    get_chat_base_url,
-    get_embedding_base_url,
-    get_default_headers,
-    AICORE_CLIENT_ID,
-)
+logger = logging.getLogger(__name__)
 
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
+
+# Free tier: 100 embed requests/min — batch size + delay keeps us well under
+EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "20"))
+EMBED_BATCH_DELAY = float(os.getenv("EMBED_BATCH_DELAY", "15"))  # seconds between batches
 
 FINANCE_PROMPT = PromptTemplate(
     input_variables=["context", "question"],
-    template="""You are FinBot, an expert AI financial analyst assistant. 
+    template="""You are FinBot, an expert AI financial analyst assistant.
 Your task is to answer questions about the financial article provided below with precision, clarity, and depth.
 
 Guidelines:
@@ -38,78 +42,88 @@ Answer:"""
 )
 
 
-class _AICoreHeaderProvider:
-    """Injects fresh AI Core auth headers into every LangChain HTTP call."""
-
-    def __call__(self):
-        return get_default_headers()
-
-
 class RAGService:
     def __init__(self):
         self.sessions: dict[str, Chroma] = {}
+        # Larger chunks = fewer chunks = fewer embed API calls
         self.splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800,
-            chunk_overlap=100,
+            chunk_size=2000,
+            chunk_overlap=200,
             separators=["\n\n", "\n", ". ", " ", ""],
         )
+        self.embeddings = GoogleGenerativeAIEmbeddings(
+            model="models/gemini-embedding-001",
+            google_api_key=GOOGLE_API_KEY,
+        )
+        self.llm = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
+            temperature=0.2,
+            google_api_key=GOOGLE_API_KEY,
+        )
 
-        # Use SAP AI Core if credentials are set, otherwise fall back to direct OpenAI
-        if AICORE_CLIENT_ID:
-            headers = get_default_headers()
-            self.embeddings = OpenAIEmbeddings(
-                model="text-embedding-ada-002",
-                openai_api_key="aicore",          # placeholder — auth via header
-                openai_api_base=get_embedding_base_url(),
-                default_headers=headers,
-                check_embedding_ctx_length=False,
-            )
-            self.llm = ChatOpenAI(
-                model="anthropic--claude-4.6-sonnet",
-                temperature=0.2,
-                openai_api_key="aicore",
-                openai_api_base=get_chat_base_url(),
-                default_headers=headers,
-            )
-        else:
-            # Fallback: direct OpenAI key
-            openai_key = os.getenv("OPENAI_API_KEY", "")
-            from langchain_community.embeddings import HuggingFaceEmbeddings
-            self.embeddings = HuggingFaceEmbeddings(
-                model_name="sentence-transformers/all-MiniLM-L6-v2",
-                model_kwargs={"device": "cpu"},
-            )
-            self.llm = ChatOpenAI(
-                model="gpt-4o-mini",
-                temperature=0.2,
-                openai_api_key=openai_key,
-            ) if openai_key else None
+    def _embed_with_backoff(self, texts: list[str]) -> list:
+        """Embed texts in batches with retry on 429 quota errors."""
+        all_embeddings = []
+        for i in range(0, len(texts), EMBED_BATCH_SIZE):
+            batch = texts[i: i + EMBED_BATCH_SIZE]
+            batch_num = i // EMBED_BATCH_SIZE + 1
+            total_batches = (len(texts) + EMBED_BATCH_SIZE - 1) // EMBED_BATCH_SIZE
+            logger.info(f"Embedding batch {batch_num}/{total_batches} ({len(batch)} chunks)")
 
-    def _refresh_headers(self):
-        """Refresh AI Core auth token in LLM/embedding clients."""
-        if AICORE_CLIENT_ID:
-            headers = get_default_headers()
-            if hasattr(self.llm, 'default_headers'):
-                self.llm.default_headers = headers
-            if hasattr(self.embeddings, 'default_headers'):
-                self.embeddings.default_headers = headers
+            retries = 0
+            max_retries = 5
+            while retries <= max_retries:
+                try:
+                    embeddings = self.embeddings.embed_documents(batch)
+                    all_embeddings.extend(embeddings)
+                    break
+                except ResourceExhausted as e:
+                    retries += 1
+                    # Parse retry_delay from error if available, else exponential backoff
+                    wait = min(60 * retries, 120)
+                    logger.warning(f"Quota exceeded (429), waiting {wait}s before retry {retries}/{max_retries}")
+                    if retries > max_retries:
+                        raise RuntimeError(f"Embedding quota exceeded after {max_retries} retries. "
+                                           "Please wait a minute and try again.") from e
+                    time.sleep(wait)
+
+            # Pause between batches to stay under 100 req/min free tier
+            if i + EMBED_BATCH_SIZE < len(texts):
+                logger.info(f"Pausing {EMBED_BATCH_DELAY}s between batches to respect rate limit...")
+                time.sleep(EMBED_BATCH_DELAY)
+
+        return all_embeddings
 
     async def ingest_article(self, article: dict, session_id: Optional[str] = None) -> str:
         """Chunk, embed, and store article content in a session-specific vector store."""
         if not session_id:
             session_id = str(uuid.uuid4())
 
-        self._refresh_headers()
-
         chunks = self.splitter.split_text(article["content"])
-        metadatas = [{"source": article["url"], "title": article["title"], "chunk": i} for i, _ in enumerate(chunks)]
+        metadatas = [
+            {"source": article["url"], "title": article["title"], "chunk": i}
+            for i, _ in enumerate(chunks)
+        ]
+        logger.info(f"Ingesting {len(chunks)} chunks for session {session_id}")
 
         persist_path = os.path.join(CHROMA_PERSIST_DIR, session_id)
-        vectorstore = Chroma.from_texts(
-            texts=chunks,
-            embedding=self.embeddings,
+
+        # Embed with rate-limit-aware batching
+        embeddings_list = self._embed_with_backoff(chunks)
+
+        # Build Chroma store from pre-computed embeddings (no extra API calls)
+        client = chromadb.PersistentClient(path=persist_path)
+        collection = client.get_or_create_collection(name="articles")
+        collection.add(
+            ids=[f"{session_id}_{i}" for i in range(len(chunks))],
+            documents=chunks,
+            embeddings=embeddings_list,
             metadatas=metadatas,
-            persist_directory=persist_path,
+        )
+        vectorstore = Chroma(
+            client=client,
+            collection_name="articles",
+            embedding_function=self.embeddings,
         )
         self.sessions[session_id] = vectorstore
         return session_id
@@ -126,30 +140,21 @@ class RAGService:
             else:
                 raise KeyError(f"Session {session_id} not found")
 
-        self._refresh_headers()
-
         vectorstore = self.sessions[session_id]
         retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
-        if self.llm:
-            qa_chain = RetrievalQA.from_chain_type(
-                llm=self.llm,
-                chain_type="stuff",
-                retriever=retriever,
-                return_source_documents=True,
-                chain_type_kwargs={"prompt": FINANCE_PROMPT},
-            )
-            result = qa_chain.invoke({"query": question})
-            answer = result["result"]
-            sources = list(set(doc.metadata.get("source", "") for doc in result.get("source_documents", [])))
-        else:
-            docs = retriever.get_relevant_documents(question)
-            answer = (
-                "⚠️ No LLM configured. Here are the most relevant excerpts:\n\n"
-                + "\n\n---\n\n".join(doc.page_content for doc in docs[:2])
-            )
-            sources = list(set(doc.metadata.get("source", "") for doc in docs))
-
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=self.llm,
+            chain_type="stuff",
+            retriever=retriever,
+            return_source_documents=True,
+            chain_type_kwargs={"prompt": FINANCE_PROMPT},
+        )
+        result = qa_chain.invoke({"query": question})
+        answer = result["result"]
+        sources = list(set(
+            doc.metadata.get("source", "") for doc in result.get("source_documents", [])
+        ))
         return {"answer": answer, "sources": sources}
 
     async def clear_session(self, session_id: str):

@@ -70,8 +70,11 @@ async def load_article(request: LoadArticleRequest):
             word_count=article["word_count"],
             source_url=request.url,
         )
-    except Exception as e:
+    except ValueError as e:
+        # User-facing errors (bad URL, blocked site, no content, etc.)
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 
 @app.post("/api/chat", response_model=ChatResponse)
